@@ -20,18 +20,21 @@ jobs:
           script: |
             set -e
 
-            echo "Updating backend..."
+            echo "=== Update backend ==="
 
             cd /opt/my-project/backend
 
             git fetch origin
             git reset --hard origin/main
 
-            echo "Building backend..."
+            echo "=== Build backend ==="
 
             cd /opt/my-project
 
             docker compose up -d --build backend
 
+            echo "=== Check backend container ==="
+
             docker compose ps backend
-            echo "Backend deployment successful"
+
+            echo "=== Backend deploy success ==="
