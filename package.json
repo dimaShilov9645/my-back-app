@@ -21,6 +21,7 @@
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "test:concurrency": "tsx --tsconfig tsconfig.json scripts/concurrency.ts",
+    "test:reservations": "tsx --tsconfig tsconfig.json scripts/reservation-expiration.ts",
     "set:products": "tsx --tsconfig tsconfig.json scripts/products.ts",
     "set:keys": "tsx --tsconfig tsconfig.json scripts/keys.ts"
   },

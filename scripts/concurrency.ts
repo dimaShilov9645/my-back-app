@@ -34,19 +34,55 @@ type WebhookResponse = {
   duplicate: boolean;
 };
 
+type ApiErrorResponse = {
+  statusCode?: number;
+  code?: string;
+  message?: string | string[];
+};
+
+type HttpResult<T> = {
+  status: number;
+  body: T;
+};
+
 async function post<T>(
   path: string,
   body: unknown,
   expectedStatus: number,
 ): Promise<T> {
-  const response = await fetch(`${API_URL}${path}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(15_000),
-  });
+  let response: Response;
+
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (error: unknown) {
+    const cause =
+      error instanceof Error && 'cause' in error ? error.cause : undefined;
+
+    const causeMessage =
+      cause instanceof Error
+        ? `${cause.name}: ${cause.message}`
+        : String(cause ?? '');
+
+    const causeCode =
+      typeof cause === 'object' && cause !== null && 'code' in cause
+        ? String(cause.code)
+        : 'unknown';
+
+    throw new Error(
+      `${path}: запрос не дошёл до API; ` +
+        `code=${causeCode}; cause=${causeMessage}`,
+      {
+        cause: error,
+      },
+    );
+  }
 
   const text = await response.text();
 
@@ -59,6 +95,38 @@ async function post<T>(
   return JSON.parse(text) as T;
 }
 
+async function postResult<T>(
+  path: string,
+  body: unknown,
+): Promise<HttpResult<T>> {
+  const response = await fetch(`${API_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  });
+
+  const text = await response.text();
+
+  let parsedBody: unknown = null;
+
+  if (text) {
+    try {
+      parsedBody = JSON.parse(text);
+    } catch {
+      parsedBody = {
+        message: text,
+      };
+    }
+  }
+
+  return {
+    status: response.status,
+    body: parsedBody as T,
+  };
+}
 // Дожидаемся всех запросов, даже если один завершился ошибкой.
 async function parallel<T>(tasks: Promise<T>[]): Promise<T[]> {
   const results = await Promise.allSettled(tasks);
@@ -88,6 +156,9 @@ async function freeKeyCount(productId: string) {
     where: {
       productId,
       delivery: {
+        is: null,
+      },
+      reservation: {
         is: null,
       },
     },
@@ -124,7 +195,7 @@ async function waitForProcessing(eventIds: string[]) {
 async function verifyDelivery(
   productId: string,
   orderId: string,
-  freeBefore: number,
+  expectedFreeKeyCount: number,
 ) {
   const order = await prisma.order.findUniqueOrThrow({
     where: {
@@ -134,36 +205,21 @@ async function verifyDelivery(
 
   assert.equal(order.status, 'delivered');
 
-  const orderDeliveries = await prisma.delivery.findMany({
+  const deliveries = await prisma.delivery.findMany({
     where: {
       orderId,
     },
-    include: {
-      productKey: true,
-    },
   });
 
-  assert.equal(
-    orderDeliveries.length,
-    1,
-    'У заказа должна быть ровно одна выдача',
-  );
-
-  const delivery = orderDeliveries[0]!;
-
-  assert.equal(
-    delivery.productKey.productId,
-    productId,
-    'Выдан ключ другого товара',
-  );
+  assert.equal(deliveries.length, 1, 'У заказа должна быть ровно одна выдача');
 
   assert.equal(
     await freeKeyCount(productId),
-    freeBefore - 1,
-    'Из пула должен быть использован ровно один ключ',
+    expectedFreeKeyCount,
+    'Количество доступных ключей не совпадает',
   );
 
-  return delivery;
+  return deliveries[0]!;
 }
 
 async function runScenario(
@@ -193,6 +249,14 @@ async function runScenario(
   );
 
   const order = orders[0]!;
+
+  const freeAfterReservation = await freeKeyCount(productId);
+
+  assert.equal(
+    freeAfterReservation,
+    freeBefore - 1,
+    'Создание заказа должно забронировать ровно один ключ',
+  );
 
   assert.equal(
     new Set(orders.map((item) => item.id)).size,
@@ -280,7 +344,11 @@ async function runScenario(
     'Неожиданное количество событий в БД',
   );
 
-  const firstDelivery = await verifyDelivery(productId, order.id, freeBefore);
+  const firstDelivery = await verifyDelivery(
+    productId,
+    order.id,
+    freeAfterReservation,
+  );
 
   // Повторяем событие уже после завершённой выдачи.
   const repeatedResponse = await post<WebhookResponse>(
@@ -297,7 +365,7 @@ async function runScenario(
   const repeatedDelivery = await verifyDelivery(
     productId,
     order.id,
-    freeBefore,
+    freeAfterReservation,
   );
 
   assert.equal(repeatedDelivery.id, firstDelivery.id);
@@ -306,12 +374,294 @@ async function runScenario(
   console.log(`OK: ${mode}; заказ ${order.id}; одна выдача, один ключ`);
 }
 
+
+type TestProduct = {
+  id: string;
+  name: string;
+  price: number;
+  currency: string;
+};
+
+type LockedProductKey = {
+  id: string;
+};
+
+async function createReservedOrderWithId(params: {
+  orderId: string;
+  idempotencyKey: string;
+  product: TestProduct;
+}) {
+  const { orderId, idempotencyKey, product } = params;
+
+  return prisma.$transaction(async (tx) => {
+    const productKeys = await tx.$queryRaw<LockedProductKey[]>`
+      SELECT pk."id"
+      FROM "product_keys" AS pk
+      WHERE pk."productId" = ${product.id}::uuid
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "reservations" AS r
+          WHERE r."productKeyId" = pk."id"
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "deliveries" AS d
+          WHERE d."productKeyId" = pk."id"
+        )
+      ORDER BY pk."createdAt" ASC
+      FOR UPDATE OF pk SKIP LOCKED
+      LIMIT 1
+    `;
+
+    const productKey = productKeys[0];
+
+    if (!productKey) {
+      throw new Error(
+        `Нет свободного ключа для тестового товара ${product.id}`,
+      );
+    }
+
+    const order = await tx.order.create({
+      data: {
+        id: orderId,
+        idempotencyKey,
+        productId: product.id,
+        productName: product.name,
+        amount: product.price,
+        currency: product.currency,
+      },
+    });
+
+    await tx.reservation.create({
+      data: {
+        orderId: order.id,
+        productKeyId: productKey.id,
+        expiresAt: new Date(Date.now() + 5 * 60 * 1_000),
+      },
+    });
+
+    await tx.product.update({
+      where: {
+        id: product.id,
+      },
+      data: {
+        version: {
+          increment: 1,
+        },
+      },
+    });
+
+    return order;
+  });
+}
+
+async function runLastUnitRace() {
+  console.log('\nЗапуск: last-unit-race');
+
+  const runId = randomUUID();
+
+  /*
+   * Для этой проверки создаём отдельный товар
+   * ровно с одним ключом.
+   */
+  const product = await prisma.product.create({
+    data: {
+      sku: `TEST-LAST-UNIT-${runId}`,
+      name: 'Тест покупки последней единицы',
+      type: 'key',
+      price: 159000,
+      currency: 'RUB',
+      isActive: true,
+
+      productKeys: {
+        create: {
+          code: `TEST-LAST-KEY-${runId}`,
+        },
+      },
+    },
+  });
+
+  assert.equal(
+    await freeKeyCount(product.id),
+    1,
+    'Перед гонкой должен существовать ровно один свободный ключ',
+  );
+
+  /*
+   * Это разные покупатели, поэтому idempotencyKey
+   * у каждого запроса свой.
+   */
+  const results = await parallel(
+    Array.from({ length: CONCURRENCY }, () =>
+      postResult<OrderResponse | ApiErrorResponse>('/orders', {
+        productId: product.id,
+        idempotencyKey: randomUUID(),
+        expectedPrice: product.price,
+      }),
+    ),
+  );
+
+  const successfulRequests = results.filter((result) => result.status === 201);
+
+  const rejectedRequests = results.filter((result) => result.status === 409);
+
+  const unexpectedRequests = results.filter(
+    (result) => result.status !== 201 && result.status !== 409,
+  );
+
+  assert.equal(
+    unexpectedRequests.length,
+    0,
+    `Получены неожиданные HTTP-ответы:\n${JSON.stringify(
+      unexpectedRequests,
+      null,
+      2,
+    )}`,
+  );
+
+  assert.equal(
+    successfulRequests.length,
+    1,
+    `Последнюю единицу должен забронировать ровно один покупатель. Успешных запросов: ${successfulRequests.length}`,
+  );
+
+  assert.equal(
+    rejectedRequests.length,
+    CONCURRENCY - 1,
+    `Ожидалось ${CONCURRENCY - 1} отказов OUT_OF_STOCK`,
+  );
+
+  assert.ok(
+    rejectedRequests.every((result) => {
+      const body = result.body as ApiErrorResponse;
+
+      return body.code === 'OUT_OF_STOCK';
+    }),
+    `Все проигравшие должны получить OUT_OF_STOCK:\n${JSON.stringify(
+      rejectedRequests,
+      null,
+      2,
+    )}`,
+  );
+
+  const winner = successfulRequests[0]!.body as OrderResponse;
+
+  /*
+   * Транзакции проигравших должны полностью откатиться.
+   * Поэтому сохраняется только заказ победителя.
+   */
+  assert.equal(
+    await prisma.order.count({
+      where: {
+        productId: product.id,
+      },
+    }),
+    1,
+    'В БД должен остаться только заказ победителя',
+  );
+
+  assert.equal(
+    await prisma.reservation.count({
+      where: {
+        orderId: winner.id,
+      },
+    }),
+    1,
+    'У победителя должна быть ровно одна бронь',
+  );
+
+  assert.equal(
+    await prisma.delivery.count({
+      where: {
+        orderId: winner.id,
+      },
+    }),
+    0,
+    'До оплаты выдачи быть не должно',
+  );
+
+  assert.equal(
+    await freeKeyCount(product.id),
+    0,
+    'Последний ключ должен стать недоступным сразу после бронирования',
+  );
+
+  /*
+   * Оплачивает только победитель.
+   */
+  const paymentEventId = `evt-last-unit-${randomUUID()}`;
+
+  await post<WebhookResponse>(
+    '/webhook/payment',
+    {
+      event_id: paymentEventId,
+      order_id: winner.id,
+      status: 'paid',
+      amount: winner.amount / 100,
+      currency: winner.currency,
+      created_at: new Date().toISOString(),
+    },
+    200,
+  );
+
+  await waitForProcessing([paymentEventId]);
+
+  await verifyDelivery(product.id, winner.id, 0);
+
+  assert.equal(
+    await prisma.reservation.count({
+      where: {
+        orderId: winner.id,
+      },
+    }),
+    0,
+    'После выдачи бронь должна быть удалена',
+  );
+
+  assert.equal(
+    await prisma.delivery.count({
+      where: {
+        orderId: winner.id,
+      },
+    }),
+    1,
+    'Победитель должен получить ровно одну выдачу',
+  );
+
+  assert.equal(
+    await prisma.delivery.count({
+      where: {
+        productKey: {
+          productId: product.id,
+        },
+      },
+    }),
+    1,
+    'Последний ключ должен быть выдан ровно один раз',
+  );
+
+  await prisma.product.update({
+    where: {
+      id: product.id,
+    },
+    data: {
+      isActive: false,
+    },
+  });
+
+  console.log(
+    `OK: last-unit-race; победитель ${winner.id}; ` +
+      `1 успешный запрос, ${CONCURRENCY - 1} отказов`,
+  );
+}
+
 async function main() {
   await prisma.$connect();
 
   // Отдельный товар при каждом запуске:
   // старые заказы и остатки не влияют на результат.
   const runId = randomUUID();
+
 
   const product = await prisma.product.create({
     data: {
@@ -339,8 +689,8 @@ async function main() {
 
   assert.equal(
     await freeKeyCount(product.id),
-    5,
-    'После всех сценариев должно остаться пять свободных ключей',
+    4,
+    'После всех сценариев должно остаться четыре свободных ключа',
   );
 
   // Убираем тестовый товар из витрины, сохраняя результаты в БД.
@@ -352,6 +702,8 @@ async function main() {
       isActive: false,
     },
   });
+
+  await runLastUnitRace();
 
   console.log('\nВсе проверки пройдены.');
 }
@@ -444,23 +796,16 @@ async function runEdgeCases(productId: string) {
 
   assert.equal(earlyDuplicate.duplicate, true);
 
-  // В тесте задаём ID вручную, чтобы воспроизвести появление
-  // именно того заказа, который указан в раннем webhook.
-  await prisma.order.create({
-    data: {
-      id: futureOrderId,
-      idempotencyKey: randomUUID(),
-      productId,
-      productName: product.name,
-      amount: product.price,
-      currency: product.currency,
-    },
+  await createReservedOrderWithId({
+    orderId: futureOrderId,
+    idempotencyKey: randomUUID(),
+    product,
   });
 
   // Здесь ждём настоящий фоновый обработчик работающего API.
   await waitForProcessing([earlyPayment.event_id]);
 
-  await verifyDelivery(productId, futureOrderId, freeBeforeEarly);
+  await verifyDelivery(productId, futureOrderId, freeBeforeEarly - 1);
 
   console.log('OK: раннее событие дождалось заказа; выдан один ключ');
 
@@ -529,7 +874,7 @@ async function runEdgeCases(productId: string) {
     makePayment(mismatchOrder.id, 'failed'),
   );
 
-  assert.equal(lateFailure.processingResult, 'ignored_final_order');
+  assert.equal(lateFailure.processingResult, 'ignored_already_delivered');
 
   const unchangedDelivery = await verifyDelivery(
     productId,
@@ -563,18 +908,20 @@ async function runEdgeCases(productId: string) {
 
   assert.equal(failedState.status, 'payment_failed');
 
-  // По принятому правилу payment_failed — финальный статус.
+  /*
+   * Пока бронь активна, после failed можно повторить оплату.
+   */
   const lateSuccess = await sendAndWait(makePayment(failedOrder.id, 'paid'));
 
-  assert.equal(lateSuccess.processingResult, 'ignored_final_order');
+  assert.equal(lateSuccess.processingResult, 'delivered');
 
-  const finalFailedState = await prisma.order.findUniqueOrThrow({
+  const finalOrder = await prisma.order.findUniqueOrThrow({
     where: {
       id: failedOrder.id,
     },
   });
 
-  assert.equal(finalFailedState.status, 'payment_failed');
+  assert.equal(finalOrder.status, 'delivered');
 
   assert.equal(
     await prisma.delivery.count({
@@ -582,12 +929,16 @@ async function runEdgeCases(productId: string) {
         orderId: failedOrder.id,
       },
     }),
-    0,
+    1,
   );
 
+  /*
+   * Ключ перестал быть доступным уже в момент бронирования,
+   * поэтому успешная выдача больше не уменьшает доступный остаток.
+   */
   assert.equal(await freeKeyCount(productId), freeBeforeFailure);
 
-  console.log('OK: неуспешная оплата не выдала ключ');
+  console.log('OK: после failed повторная оплата выдала забронированный ключ');
 }
 
 main()

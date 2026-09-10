@@ -5,15 +5,48 @@ import { PrismaService } from '../prisma/prisma.service.js';
 export class ProductsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  findAll() {
-    return this.prisma.product.findMany({
+  async findAll() {
+    const products = await this.prisma.product.findMany({
       where: {
         isActive: true,
       },
       orderBy: {
-        name: 'asc',
+        createdAt: 'asc',
+      },
+      select: {
+        id: true,
+        sku: true,
+        name: true,
+        type: true,
+        price: true,
+        currency: true,
+        image: true,
+        isActive: true,
+        version: true,
+        createdAt: true,
+        updatedAt: true,
+
+        _count: {
+          select: {
+            productKeys: {
+              where: {
+                reservation: {
+                  is: null,
+                },
+                delivery: {
+                  is: null,
+                },
+              },
+            },
+          },
+        },
       },
     });
+
+    return products.map(({ _count, ...product }) => ({
+      ...product,
+      availableCount: _count.productKeys,
+    }));
   }
 
   async findOne(id: string) {

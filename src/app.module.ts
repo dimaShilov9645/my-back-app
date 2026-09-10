@@ -7,6 +7,8 @@ import { OrdersModule } from './orders/orders.module.js';
 import { DeliveriesModule } from './deliveries/deliveries.module.js';
 import { PaymentsModule } from './payments/payments.module.js';
 import { ScheduleModule } from '@nestjs/schedule';
+import { ReservationsModule } from './reservations/reservations.module.js';
+import { CatalogModule } from './catalog/catalog.module.js';
 
 @Module({
   imports: [
@@ -16,6 +18,8 @@ import { ScheduleModule } from '@nestjs/schedule';
     OrdersModule,
     DeliveriesModule,
     PaymentsModule,
+    ReservationsModule,
+    CatalogModule,
   ],
   controllers: [AppController],
   providers: [AppService],

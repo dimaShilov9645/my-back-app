@@ -11,7 +11,6 @@ import { PrismaService } from '../prisma/prisma.service.js';
 export class DeliveriesService {
   constructor(private readonly prisma: PrismaService) {}
 
-  // Самостоятельная выдача — например, для повторной попытки.
   async deliver(orderId: string) {
     return this.prisma.$transaction(
       (tx) => this.deliverInTransaction(tx, orderId),
@@ -23,57 +22,79 @@ export class DeliveriesService {
     );
   }
 
-  // Выдача как часть уже открытой транзакции.
   async deliverInTransaction(tx: Prisma.TransactionClient, orderId: string) {
+
     await tx.$queryRaw`
-      SELECT id
-      FROM orders
-      WHERE id = ${orderId}::uuid
+        SELECT id
+        FROM orders
+        WHERE id = ${orderId}::uuid
       FOR UPDATE
     `;
 
     const order = await tx.order.findUnique({
-      where: { id: orderId },
+      where: {
+        id: orderId,
+      },
     });
 
     if (!order) {
-      throw new NotFoundException('Заказ не найден');
+      throw new NotFoundException({
+        code: 'ORDER_NOT_FOUND',
+        message: 'Заказ не найден',
+      });
     }
 
     const existingDelivery = await tx.delivery.findUnique({
-      where: { orderId },
+      where: {
+        orderId,
+      },
     });
 
     if (existingDelivery) {
+      await tx.reservation.deleteMany({
+        where: {
+          orderId,
+        },
+      });
+
+      if (order.status !== 'delivered') {
+        await tx.order.update({
+          where: {
+            id: orderId,
+          },
+          data: {
+            status: 'delivered',
+          },
+        });
+      }
+
       return existingDelivery;
     }
 
-    if (order.status !== 'paid' && order.status !== 'out_of_stock') {
-      throw new ConflictException('Заказ не находится в состоянии для выдачи');
+    if (order.status !== 'paid') {
+      throw new ConflictException({
+        code: 'ORDER_NOT_PAID',
+        message: 'Заказ ещё не оплачен',
+      });
     }
 
-    await tx.$queryRaw`
-      SELECT id
-      FROM products
-      WHERE id = ${order.productId}::uuid
-      FOR UPDATE
-    `;
-
-    const key = await tx.productKey.findFirst({
+    const reservation = await tx.reservation.findUnique({
       where: {
-        productId: order.productId,
-        delivery: {
-          is: null,
-        },
+        orderId,
       },
-      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      select: {
+        id: true,
+        productKeyId: true,
+      },
     });
 
-    if (!key) {
+    if (!reservation) {
       await tx.order.update({
-        where: { id: orderId },
+        where: {
+          id: orderId,
+        },
         data: {
-          status: 'out_of_stock',
+          status: 'delivery_failed',
         },
       });
 
@@ -83,12 +104,20 @@ export class DeliveriesService {
     const delivery = await tx.delivery.create({
       data: {
         orderId,
-        productKeyId: key.id,
+        productKeyId: reservation.productKeyId,
+      },
+    });
+
+    await tx.reservation.delete({
+      where: {
+        id: reservation.id,
       },
     });
 
     await tx.order.update({
-      where: { id: orderId },
+      where: {
+        id: orderId,
+      },
       data: {
         status: 'delivered',
       },
