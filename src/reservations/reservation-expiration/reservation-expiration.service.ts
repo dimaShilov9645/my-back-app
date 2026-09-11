@@ -3,6 +3,7 @@ import { Interval } from '@nestjs/schedule';
 
 import { Prisma } from '../../generated/prisma/client.js';
 import { PrismaService } from '../../prisma/prisma.service.js';
+import { CatalogEventsService } from '../../catalog/catalog-events/catalog-events.service.js';
 
 @Injectable()
 export class ReservationExpirationService {
@@ -10,7 +11,10 @@ export class ReservationExpirationService {
 
   private running = false;
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly catalogEventsService: CatalogEventsService,
+  ) {}
 
   @Interval('release-expired-reservations', 1_000)
   async releaseExpiredReservations() {
@@ -146,7 +150,7 @@ export class ReservationExpirationService {
             status: 'expired',
           },
         });
-        
+
         const updatedProduct = await tx.product.update({
           where: {
             id: order.productId,
@@ -178,8 +182,21 @@ export class ReservationExpirationService {
 
     if (result?.status === 'expired') {
       this.logger.log(`Бронь заказа ${result.orderId} истекла`);
+
+      await this.notifyProductChanged(result.productId);
     }
 
     return result;
+  }
+
+  private async notifyProductChanged(productId: string): Promise<void> {
+    try {
+      await this.catalogEventsService.publishProductChanged(productId);
+    } catch (error: unknown) {
+      this.logger.error(
+        `Не удалось отправить обновление товара ${productId}`,
+        error instanceof Error ? error.stack : String(error),
+      );
+    }
   }
 }

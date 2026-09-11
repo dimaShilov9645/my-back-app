@@ -2,8 +2,10 @@ import {
   ConflictException,
   Injectable,
   NotFoundException,
+  Logger,
 } from '@nestjs/common';
 
+import { CatalogEventsService } from '../catalog/catalog-events/catalog-events.service.js';
 import { Prisma } from '../generated/prisma/client.js';
 import { PrismaService } from '../prisma/prisma.service.js';
 
@@ -57,7 +59,12 @@ type ReserveProductResult = OrderWithReservation & {
 
 @Injectable()
 export class ReservationsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(ReservationsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly catalogEventsService: CatalogEventsService,
+  ) {}
 
   async reserveProduct(
     input: ReserveProductInput,
@@ -194,7 +201,9 @@ export class ReservationsService {
           timeout: 10_000,
         },
       );
-
+      if (!result.idempotentReplay) {
+        await this.notifyProductChanged(input.productId);
+      }
       return this.buildResponse(result.order, result.idempotentReplay);
     } catch (error: unknown) {
       if (
@@ -239,6 +248,17 @@ export class ReservationsService {
         code: 'IDEMPOTENCY_KEY_REUSED',
         message: 'Этот idempotencyKey уже использован для другого товара',
       });
+    }
+  }
+
+  private async notifyProductChanged(productId: string): Promise<void> {
+    try {
+      await this.catalogEventsService.publishProductChanged(productId);
+    } catch (error: unknown) {
+      this.logger.error(
+        `Не удалось отправить обновление товара ${productId}`,
+        error instanceof Error ? error.stack : String(error),
+      );
     }
   }
 
