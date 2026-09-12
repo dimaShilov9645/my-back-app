@@ -10,7 +10,7 @@ export class PaymentsService {
 
   async receive(dto: PaymentWebhookDto) {
     const orderId = dto.order_id.toLowerCase();
-    const amount = new Prisma.Decimal(dto.amount);
+    const amount = Number(dto.amount);
     const occurredAt = new Date(dto.created_at);
 
     try {
@@ -42,7 +42,7 @@ export class PaymentsService {
         const sameEvent =
           existing.orderId === orderId &&
           existing.status === dto.status &&
-          existing.amount.equals(amount) &&
+          existing.amount === Number(amount) &&
           existing.currency === dto.currency &&
           existing.occurredAt.getTime() === occurredAt.getTime();
 
@@ -60,7 +60,6 @@ export class PaymentsService {
 
       throw error;
     }
-
     return {
       accepted: true,
       duplicate: false,

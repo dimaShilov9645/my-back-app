@@ -105,11 +105,11 @@ export class PaymentProcessorService {
             },
           });
 
-        const receivedAmountInKopecks = event.amount.mul(100);
+        const receivedAmountInKopecks = event.amount;
 
         if (
           event.currency !== order.currency ||
-          !receivedAmountInKopecks.equals(order.amount)
+          receivedAmountInKopecks !== order.amount
         ) {
           await finish('amount_or_currency_mismatch');
           return;

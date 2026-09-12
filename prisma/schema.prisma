@@ -109,7 +109,7 @@ model PaymentEvent {
   eventId          String        @id @db.VarChar(128)
   orderId          String        @db.Uuid
   status           PaymentStatus
-  amount           Decimal       @db.Decimal(12, 2)
+  amount           Int
   currency         String        @db.VarChar(3)
   occurredAt       DateTime      @db.Timestamptz(3)
   receivedAt       DateTime      @default(now()) @db.Timestamptz(3)
